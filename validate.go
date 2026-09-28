@@ -129,6 +129,23 @@ func validateZoneView(zone string, view map[string]RecordSet, p Policy) *Error {
 		if len(rs.Records) == 0 {
 			issues = append(issues, fmt.Sprintf("%s %s: record set is empty", rs.Name, rs.Type))
 		}
+		if len(rs.Weights) > 0 {
+			if len(rs.Weights) != len(rs.Records) {
+				issues = append(issues, fmt.Sprintf("%s %s: weights count %d != records count %d",
+					rs.Name, rs.Type, len(rs.Weights), len(rs.Records)))
+			} else {
+				var sum uint32
+				for _, w := range rs.Weights {
+					sum += w
+				}
+				if sum == 0 {
+					issues = append(issues, fmt.Sprintf("%s %s: weighted record set has no positive weight", rs.Name, rs.Type))
+				}
+			}
+			if rs.Type != TypeA && rs.Type != TypeAAAA {
+				issues = append(issues, fmt.Sprintf("%s %s: weights are only allowed on A/AAAA record sets", rs.Name, rs.Type))
+			}
+		}
 		seenRec := make(map[string]bool, len(rs.Records))
 		for _, r := range rs.Records {
 			if r == "" {
@@ -206,17 +223,29 @@ func sortedSets(view map[string]RecordSet) []RecordSet {
 	return out
 }
 
-// setsEqual 比较两个记录集是否内容一致（记录顺序无关）。
+// setsEqual 比较两个记录集是否内容一致（记录顺序无关，权重与记录配对比较）。
 func setsEqual(a, b RecordSet) bool {
 	if a.Name != b.Name || a.Type != b.Type || a.TTL != b.TTL || len(a.Records) != len(b.Records) {
 		return false
 	}
-	as := append([]string(nil), a.Records...)
-	bs := append([]string(nil), b.Records...)
-	sort.Strings(as)
-	sort.Strings(bs)
-	for i := range as {
-		if as[i] != bs[i] {
+	if len(a.Weights) != len(b.Weights) {
+		return false
+	}
+	wa := map[string]uint32{}
+	for i, r := range a.Records {
+		var w uint32
+		if i < len(a.Weights) {
+			w = a.Weights[i]
+		}
+		wa[r] = w
+	}
+	for i, r := range b.Records {
+		var w uint32
+		if i < len(b.Weights) {
+			w = b.Weights[i]
+		}
+		aw, ok := wa[r]
+		if !ok || aw != w {
 			return false
 		}
 	}

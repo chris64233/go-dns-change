@@ -347,6 +347,13 @@ func (s *Service) Withdraw(zone, id, actor string) (*Change, error) {
 		case StatusPublished:
 			return errf(KindState, "change %s is already published and cannot be withdrawn", id)
 		}
+		// 进行中分阶段计划的目标变更不能撤回，否则计划目标将失效。
+		for _, p := range z.Plans {
+			if p.Status == PlanActive && p.TargetChangeID == id {
+				return errf(KindState,
+					"change %s is attached to active plan %s and cannot be withdrawn", id, p.ID)
+			}
+		}
 		z.Seq++
 		chg.Status = StatusWithdrawn
 		chg.Seq = z.Seq
@@ -377,6 +384,14 @@ func (s *Service) Publish(zone, id string) (*Revision, error) {
 		}
 		if chg.Status != StatusApproved {
 			return errf(KindState, "change %s is %s and cannot be published", id, chg.Status)
+		}
+		// 已审批变更若挂在进行中的分阶段计划上，只能通过阶段推进发布，
+		// 不能直接全量发布而绕过流量切换。
+		for _, p := range z.Plans {
+			if p.Status == PlanActive && p.TargetChangeID == id {
+				return errf(KindState,
+					"change %s is attached to active plan %s; advance the plan instead", id, p.ID)
+			}
 		}
 		if chg.Revision <= z.PublishedRevision {
 			return errf(KindState,
