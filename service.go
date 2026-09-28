@@ -220,11 +220,23 @@ func (s *Service) submitLocked(z *ZoneState, in SubmitInput, rollbackOf int64) (
 			"base revision %d is stale: zone %s head is at revision %d",
 			in.BaseRevision, z.Name, z.HeadRevision)
 	}
+	// 分阶段计划刚创建、首个阶段尚未发布时，头部是尚未上线的目标修订；
+	// 此时禁止在其之上叠加新变更（需要先停止计划）。阶段一旦发布，
+	// 头部即当前已发布阶段，提交自然以该阶段为基准。
+	if p := activePlan(z); p != nil && z.HeadRevision != z.PublishedRevision {
+		return nil, errf(KindState,
+			"rollout plan %s is active before its first stage; stop the plan before submitting new changes", p.ID)
+	}
 
 	view := viewAt(z, z.HeadRevision)
 	newView, verr := applyOps(view, in.Ops)
 	if verr != nil {
 		return nil, verr
+	}
+	// 权重只是分阶段中间视图的内部产物；普通变更与回滚产生的视图一律不带权重。
+	for k, rs := range newView {
+		rs.Weights = nil
+		newView[k] = rs
 	}
 	if verr := validateZoneView(z.Name, newView, z.Policy); verr != nil {
 		return nil, verr
@@ -291,6 +303,10 @@ func (s *Service) Approve(zone, id, approver string) (*Change, error) {
 			return errf(KindState, "change %s is withdrawn and cannot be approved", id)
 		case StatusPublished:
 			return errf(KindState, "change %s is already published", id)
+		case StatusRolling:
+			return errf(KindState, "change %s is being rolled out in stages and cannot be approved again", id)
+		case StatusStopped, StatusRecovered:
+			return errf(KindState, "change %s is %s and cannot be approved", id, chg.Status)
 		}
 		// 同一审批人重复审批：幂等成功。
 		for _, a := range chg.Approvals {
@@ -346,11 +362,22 @@ func (s *Service) Withdraw(zone, id, actor string) (*Change, error) {
 			return nil
 		case StatusPublished:
 			return errf(KindState, "change %s is already published and cannot be withdrawn", id)
+		case StatusRolling:
+			return errf(KindState, "change %s is mid rollout; use StopRollout to halt it instead of Withdraw", id)
+		case StatusRecovered:
+			return errf(KindState, "change %s was recovered by a new revision and cannot be withdrawn", id)
 		}
 		z.Seq++
 		chg.Status = StatusWithdrawn
 		chg.Seq = z.Seq
 		chg.UpdatedAt = s.now()
+		// 撤销正在分阶段发布的目标变更时，同步终止其计划，流量停在当前已发布阶段。
+		for _, p := range z.Plans {
+			if p.ChangeID == chg.ID && p.Status == PlanActive {
+				p.Status = PlanStopped
+				p.UpdatedAt = s.now()
+			}
+		}
 		out = chg
 		return nil
 	})
@@ -375,8 +402,17 @@ func (s *Service) Publish(zone, id string) (*Revision, error) {
 			out = rev // 幂等：不重复写 outbox
 			return nil
 		}
+		if chg.Status == StatusRolling {
+			return errf(KindState,
+				"change %s is being rolled out in stages; use AdvanceStage/StopRollout instead of Publish", id)
+		}
 		if chg.Status != StatusApproved {
 			return errf(KindState, "change %s is %s and cannot be published", id, chg.Status)
+		}
+		if p := planOfChange(z, chg.ID); p != nil && p.Status == PlanActive {
+			return errf(KindState,
+				"change %s has an active rollout plan %s; withdraw the plan target or stop the plan instead of direct publish",
+				id, p.ID)
 		}
 		if chg.Revision <= z.PublishedRevision {
 			return errf(KindState,
@@ -392,6 +428,17 @@ func (s *Service) Publish(zone, id string) (*Revision, error) {
 			ID: outboxID(z.Name, rev.Number), Zone: z.Name, Revision: rev.Number,
 			RecordSets: rev.RecordSets, Seq: z.Seq, CreatedAt: s.now(),
 		})
+		// 分阶段计划执行期间若有另一个变更实际发布，它一定以当前已发布阶段为基准
+		// （头部即已发布阶段时才能提交）。旧计划随即失效，不能再推进或覆盖该修订。
+		if p := activePlan(z); p != nil && chg.PlanID == "" {
+			if target := findChange(z, p.ChangeID); target != nil {
+				target.Status = StatusStopped
+				target.UpdatedAt = s.now()
+			}
+			p.Status = PlanStopped
+			p.Superseded = true
+			p.UpdatedAt = s.now()
+		}
 		out = rev
 		return nil
 	})

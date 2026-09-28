@@ -62,6 +62,8 @@ func normalizeOps(ops []ChangeOp) ([]ChangeOp, *Error) {
 				recs[j] = strings.TrimSpace(r)
 			}
 			op.RecordSet.Records = recs
+			// 权重只是分阶段中间视图的内部产物，外部变更不能直接携带。
+			op.RecordSet.Weights = nil
 		}
 		out[i] = op
 	}
@@ -206,9 +208,10 @@ func sortedSets(view map[string]RecordSet) []RecordSet {
 	return out
 }
 
-// setsEqual 比较两个记录集是否内容一致（记录顺序无关）。
+// setsEqual 比较两个记录集是否内容一致（记录与权重顺序无关）。
 func setsEqual(a, b RecordSet) bool {
-	if a.Name != b.Name || a.Type != b.Type || a.TTL != b.TTL || len(a.Records) != len(b.Records) {
+	if a.Name != b.Name || a.Type != b.Type || a.TTL != b.TTL ||
+		len(a.Records) != len(b.Records) || len(a.Weights) != len(b.Weights) {
 		return false
 	}
 	as := append([]string(nil), a.Records...)
@@ -217,6 +220,15 @@ func setsEqual(a, b RecordSet) bool {
 	sort.Strings(bs)
 	for i := range as {
 		if as[i] != bs[i] {
+			return false
+		}
+	}
+	aw := append([]WeightedRecord(nil), a.Weights...)
+	bw := append([]WeightedRecord(nil), b.Weights...)
+	sort.Slice(aw, func(i, j int) bool { return aw[i].Record < aw[j].Record })
+	sort.Slice(bw, func(i, j int) bool { return bw[i].Record < bw[j].Record })
+	for i := range aw {
+		if aw[i] != bw[i] {
 			return false
 		}
 	}
